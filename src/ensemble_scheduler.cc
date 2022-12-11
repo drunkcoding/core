@@ -1246,6 +1246,7 @@ EnsembleContext::ScheduleSteps(
       // request hasn't been transferred and can cause double-free, so moving
       // the request ownership out of step here to avoid that
       std::unique_ptr<InferenceRequest> request = std::move(step->request_);
+      request->SetCorrelationId(step->step_idx_);
       auto step_status = context->is_->InferAsync(request);
       if (!step_status.IsOk()) {
         std::lock_guard<std::mutex> lock(context->mutex_);
