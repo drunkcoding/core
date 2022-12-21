@@ -40,6 +40,7 @@
 #include "shared_library.h"
 #include "triton/common/logging.h"
 #include "tritonserver_apis.h"
+#include "frequency_batch_scheduler.h"
 
 // For unknown reason, windows will not export the TRITONBACKEND_*
 // functions declared with dllexport in tritonbackend.h. To get those
@@ -401,12 +402,12 @@ TritonModel::SetConfiguredScheduler()
   } else if (config_.has_frequency_batching()) {
     // Frequency batcher
     // TODO: implement frequency batcher
-    // RETURN_IF_ERROR(FrequencyBatchScheduler::Create(
-    //     this, nullptr, 0 /*nice*/, true /* dynamic_batching_enabled */,
-    //     config_.max_batch_size(), enforce_equal_shape_tensors,
-    //     config_.frequency_batching(),
-    //     config_.response_cache().enable() /* response_cache_enable */,
-    //     &scheduler));
+    RETURN_IF_ERROR(FrequencyBatchScheduler::Create(
+        this, nullptr, 0 /*nice*/, true /* dynamic_batching_enabled */,
+        config_.max_batch_size(), enforce_equal_shape_tensors,
+        config_.frequency_batching(),
+        config_.response_cache().enable() /* response_cache_enable */,
+        &scheduler));
   } else {
     // Default scheduler. Use dynamic batch scheduler (with batching
     // disabled) as the default scheduler.

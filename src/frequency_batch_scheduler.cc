@@ -39,13 +39,14 @@
 
 namespace triton { namespace core {
 
-bool
-IsStaleState(Payload::State payload_state)
-{
-  return (
-      (payload_state == Payload::State::EXECUTING) ||
-      (payload_state == Payload::State::RELEASED));
-}
+extern bool IsStaleState(Payload::State payload_state);
+// bool
+// IsStaleState(Payload::State payload_state)
+// {
+//   return (
+//       (payload_state == Payload::State::EXECUTING) ||
+//       (payload_state == Payload::State::RELEASED));
+// }
 
 FrequencyBatchScheduler::FrequencyBatchScheduler(
     TritonModel* model, TritonModelInstance* model_instance,

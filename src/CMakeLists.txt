@@ -111,6 +111,7 @@ set(
   ensemble_scheduler.cc
   ensemble_utils.cc
   filesystem.cc
+  frequency_batch_scheduler.cc
   infer_parameter.cc
   infer_request.cc
   infer_response.cc
@@ -155,6 +156,7 @@ set(
   ensemble_scheduler.h
   ensemble_utils.h
   filesystem.h
+  frequency_batch_scheduler.h
   infer_parameter.h
   infer_request.h
   infer_response.h
