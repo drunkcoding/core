@@ -27,11 +27,10 @@
 
 #include <atomic>
 #include <condition_variable>
-#include <deque>
 #include <future>
 #include <map>
 #include <mutex>
-#include <queue>
+#include <deque>
 #include <set>
 #include <thread>
 #include "backend_model.h"
@@ -45,29 +44,69 @@
 
 namespace triton { namespace core {
 
+// Queue for a specific priority level. Please note that the queue is not
+// thread-safe.
+class FrequencyQueue {
+ public:
+  FrequencyQueue() : cursor_(0) {};
+  ~FrequencyQueue() = default;
+
+  // Enqueue a request with priority set to 'priority_level'. If
+  // Status::Success is returned then the queue has taken ownership of
+  // the request object and so 'request' will be nullptr. If
+  // non-success is returned then the caller still retains ownership
+  // of 'request'.
+  Status Enqueue(std::unique_ptr<InferenceRequest>& request);
+
+  // Dequeue the request at the front of the queue.
+  Status Dequeue(std::unique_ptr<InferenceRequest>* request);
+
+  size_t FindTimeout(const uint64_t oldest_timestamp);
+
+  size_t TryToBatch(const uint64_t optimal_batch_size);
+
+  inline size_t Cursor() { return cursor_; }
+
+  // Return the number of requests in the queue, rejected requests are
+  // not included.
+  inline size_t Size() { return queue_.size(); }
+
+  // Is the queue is empty? Rejected requests are not included.
+  inline bool Empty() { return queue_.empty(); }
+
+ private:
+  // The queue holding inference requests for the model represented by
+  // this scheduler.
+  std::deque<std::unique_ptr<InferenceRequest>> queue_;
+  uint64_t cursor_;
+
+  // // The frequency of the queue.
+  // const uint64_t frequency_;
+};
+
 // Scheduler that implements frequency batching.
 class FrequencyBatchScheduler : public Scheduler {
  public:
   // Create a scheduler to support a given number of runners and a run
   // function to call when a request is scheduled.
   static Status Create(
-      TritonModel* model, TritonModelInstance* model_instance, const int nice,
-      const bool frequency_batching_enabled, const int32_t max_batch_size,
-      const std::unordered_map<std::string, bool>& enforce_equal_shape_tensors,
-      const bool preserve_ordering, const bool response_cache_enable,
-      const std::set<int32_t>& preferred_batch_sizes,
-      const uint64_t max_queue_delay_microseconds,
-      std::unique_ptr<Scheduler>* scheduler);
+    TritonModel* model, TritonModelInstance* model_instance, const int nice,
+    const bool frequency_batching_enabled, const int32_t max_batch_size,
+    const int32_t optimal_batch_size,
+    const std::unordered_map<std::string, bool>& enforce_equal_shape_tensors,
+    const bool preserve_ordering, const bool response_cache_enable,
+    const uint64_t max_queue_delay_microseconds,
+    std::unique_ptr<Scheduler>* scheduler);
 
   // Create a scheduler to support a given number of runners and a run
   // function to call when a request is scheduled. And the scheduler also
   // supports different queue policies for different priority levels.
   static Status Create(
-      TritonModel* model, TritonModelInstance* model_instance, const int nice,
-      const bool frequency_batching_enabled, const int32_t max_batch_size,
-      const std::unordered_map<std::string, bool>& enforce_equal_shape_tensors,
-      const inference::ModelFrequencyBatching& batcher_config,
-      const bool response_cache_enable, std::unique_ptr<Scheduler>* scheduler);
+    TritonModel* model, TritonModelInstance* model_instance, const int nice,
+    const bool frequency_batching_enabled, const int32_t max_batch_size,
+    const std::unordered_map<std::string, bool>& enforce_equal_shape_tensors,
+    const inference::ModelFrequencyBatching& batcher_config,
+    const bool response_cache_enable, std::unique_ptr<Scheduler>* scheduler);
 
   ~FrequencyBatchScheduler();
 
@@ -91,15 +130,12 @@ class FrequencyBatchScheduler : public Scheduler {
 
  private:
   FrequencyBatchScheduler(
-      TritonModel* model, TritonModelInstance* model_instance,
-      const bool frequency_batching_enabled, const int32_t max_batch_size,
-      const std::unordered_map<std::string, bool>& enforce_equal_shape_tensors,
-      const bool preserve_ordering, const bool response_cache_enable,
-      const std::set<int32_t>& preferred_batch_sizes,
-      const uint64_t max_queue_delay_microseconds,
-      const inference::ModelQueuePolicy& default_queue_policy,
-      const uint32_t priority_levels,
-      const ModelQueuePolicyMap& queue_policy_map);
+    TritonModel* model, TritonModelInstance* model_instance,
+    const bool frequency_batching_enabled, const int32_t max_batch_size,
+    const int32_t optimal_batch_size,
+    const std::unordered_map<std::string, bool>& enforce_equal_shape_tensors,
+    const bool preserve_ordering, const bool response_cache_enable,
+    const uint64_t max_queue_delay_microseconds);
 
   void BatcherThread(const int nice);
   void NewPayload();
@@ -119,7 +155,7 @@ class FrequencyBatchScheduler : public Scheduler {
   // Map from priority level to queue holding inference requests for the model
   // represented by this scheduler. If priority queues are not supported by the
   // scheduler, then priority zero entry is used as the single queue.
-  PriorityQueue queue_;
+  FrequencyQueue queue_;
   bool stop_;
 
   std::thread scheduler_thread_;
@@ -135,14 +171,12 @@ class FrequencyBatchScheduler : public Scheduler {
   bool payload_saturated_;
 
   size_t max_batch_size_;
-  size_t max_preferred_batch_size_;
-  std::set<int32_t> preferred_batch_sizes_;
+  size_t optimal_batch_size_;
+  size_t next_preferred_batch_size_;
   uint64_t pending_batch_delay_ns_;
-  size_t pending_batch_size_;
   RequiredEqualInputs required_equal_inputs_;
 
   size_t queued_batch_size_;
-  size_t next_preferred_batch_size_;
 
   // The input tensors that require shape checking before being
   // allowed in a batch. As a map from the tensor name to a bool. If

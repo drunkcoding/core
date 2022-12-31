@@ -404,8 +404,8 @@ TritonModel::SetConfiguredScheduler()
     // TODO: implement frequency batcher
     RETURN_IF_ERROR(FrequencyBatchScheduler::Create(
         this, nullptr, 0 /*nice*/, true /* dynamic_batching_enabled */,
-        config_.max_batch_size(), enforce_equal_shape_tensors,
-        config_.frequency_batching(),
+        config_.max_batch_size(),
+        enforce_equal_shape_tensors, config_.frequency_batching(),
         config_.response_cache().enable() /* response_cache_enable */,
         &scheduler));
   } else {

@@ -229,6 +229,7 @@ DynamicBatchScheduler::Enqueue(std::unique_ptr<InferenceRequest>& request)
         model_->Server()->GetRateLimiter()->EnqueuePayload(model_, payload));
 
   } else {
+    LOG_VERBOSE(1) << request->LogRequest() << "DynamicBatchScheduler::Enqueue";
     bool wake_batcher = true;
     {
       std::lock_guard<std::mutex> lock(mu_);
@@ -258,6 +259,27 @@ DynamicBatchScheduler::Enqueue(std::unique_ptr<InferenceRequest>& request)
     }
 
     if (wake_batcher) {
+      // log the reason for waking up the batcher
+      if (enforce_equal_shape_tensors_.empty()) {
+        std::lock_guard<std::mutex> exec_lock(*(curr_payload_->GetExecMutex()));
+        auto payload_state = curr_payload_->GetState();
+        if (payload_saturated_) {
+          LOG_VERBOSE(1) << "DynamicBatchScheduler::Enqueue - wake batcher "
+                            "because payload is saturated";
+        } else if (IsStaleState(payload_state)) {
+          LOG_VERBOSE(1) << "DynamicBatchScheduler::Enqueue - wake batcher "
+                            "because payload state is stale";
+        } else {
+          LOG_VERBOSE(1) << "DynamicBatchScheduler::Enqueue - wake batcher "
+                            "because queued batch size "
+                         << queued_batch_size_
+                         << " >= next preferred batch size "
+                         << next_preferred_batch_size_;
+        }
+      } else {
+        LOG_VERBOSE(1) << "DynamicBatchScheduler::Enqueue - wake batcher "
+                          "because enforce equal shape";
+      }
       cv_.notify_one();
     }
   }
@@ -340,6 +362,8 @@ DynamicBatchScheduler::BatcherThread(const int nice)
       } else if (queue_.Empty()) {
         wait_microseconds = default_wait_microseconds;
       } else {
+        LOG_VERBOSE(1) << "Dynamic-batcher thread for " << model_->Name()
+                       << " sees " << queue_.Size() << " requests in queue";
         if (payload_saturated_) {
           continue;
         }
@@ -353,8 +377,13 @@ DynamicBatchScheduler::BatcherThread(const int nice)
             continue;
           }
 
+          auto pending_batch_queue_cnt_debug = queue_.PendingBatchCount();
           // Use dynamic batching to get request(s) to execute.
           wait_microseconds = GetDynamicBatch();
+
+          LOG_VERBOSE(1) << "Dynamic-batcher thread for " << model_->Name()
+                         << " pending batch queue count " << pending_batch_queue_cnt_debug
+                         << " wait microseconds " << wait_microseconds;
 
           // Get requests that are rejected from searching dynamic batch.
           queue_.ReleaseRejectedRequests(&rejected_requests);

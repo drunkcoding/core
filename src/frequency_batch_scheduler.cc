@@ -48,26 +48,104 @@ extern bool IsStaleState(Payload::State payload_state);
 //       (payload_state == Payload::State::RELEASED));
 // }
 
+Status
+FrequencyQueue::Enqueue(std::unique_ptr<InferenceRequest>& request)
+{
+  queue_.push_back(std::move(request));
+  return Status::Success;
+}
+
+Status
+FrequencyQueue::Dequeue(std::unique_ptr<InferenceRequest>* request)
+{
+  if (queue_.empty()) {
+    return Status(
+        Status::Code::INTERNAL,
+        "attempt to dequeue from empty frequency queue");
+  }
+
+  *request = std::move(queue_.front());
+  queue_.pop_front();
+  cursor_--;
+  LOG_VERBOSE(1) << "FrequencyQueue dequeued request "
+                 << " queue size = " << queue_.size() << " cursor = " << cursor_;
+  return Status::Success;
+}
+
+size_t
+FrequencyQueue::FindTimeout(const uint64_t oldest_timestamp)
+{
+  size_t batch_size = 0;
+  for (size_t i = cursor_; i < queue_.size(); i++) {
+    if (queue_[i]->QueueStartNs() < oldest_timestamp) {
+      cursor_++;
+      batch_size += queue_[i]->BatchSize();
+    } else {
+      break;
+    }
+  }
+  LOG_VERBOSE(1) << "FrequencyQueue found timeout batch size = " << batch_size << " queue size = "
+                 << queue_.size() << " cursor = " << cursor_;
+  return batch_size;
+}
+
+size_t
+FrequencyQueue::TryToBatch(const uint64_t optimal_batch_size)
+{
+  size_t batch_size = 0;
+  uint64_t cursor = 0;
+  bool send_batch = false;
+  for (size_t i = 0; i < queue_.size(); i++) {
+    batch_size += queue_[i]->BatchSize();
+    if (batch_size > optimal_batch_size) {
+      send_batch = true;
+      break;
+    }
+    cursor++;
+    if (batch_size == optimal_batch_size) {
+      send_batch = true;
+      break;
+    }
+  }
+  if (send_batch) {
+    cursor_ = std::max(cursor_, cursor);
+    LOG_VERBOSE(1) << "FrequencyQueue found batch size = " << batch_size
+                   << " optimal batch size = " << optimal_batch_size
+                   << " queue size = " << queue_.size()
+                   << " cursor = " << cursor_;
+    return batch_size;
+  }
+  LOG_VERBOSE(1) << "FrequencyQueue failed to batch " << batch_size
+                 << " optimal batch size = " << optimal_batch_size
+                 << " queue size = " << queue_.size()
+                 << " cursor = " << cursor_;
+  return 0;
+}
+
 FrequencyBatchScheduler::FrequencyBatchScheduler(
     TritonModel* model, TritonModelInstance* model_instance,
     const bool frequency_batching_enabled, const int32_t max_batch_size,
+    const int32_t optimal_batch_size,
     const std::unordered_map<std::string, bool>& enforce_equal_shape_tensors,
     const bool preserve_ordering, const bool response_cache_enable,
-    const std::set<int32_t>& preferred_batch_sizes,
-    const uint64_t max_queue_delay_microseconds,
-    const inference::ModelQueuePolicy& default_queue_policy,
-    const uint32_t priority_levels, const ModelQueuePolicyMap& queue_policy_map)
-    : model_(model), model_instance_(model_instance),
+    const uint64_t max_queue_delay_microseconds)
+    : model_(model),
+      model_instance_(model_instance),
       frequency_batching_enabled_(frequency_batching_enabled),
-      queue_(default_queue_policy, priority_levels, queue_policy_map),
-      stop_(false), max_batch_size_((size_t)std::max(1, max_batch_size)),
-      preferred_batch_sizes_(preferred_batch_sizes),
-      pending_batch_delay_ns_(max_queue_delay_microseconds * 1000),
-      pending_batch_size_(0), queued_batch_size_(0),
+      queue_(),
+      stop_(false),
+      max_batch_size_((size_t)std::max(1, max_batch_size)),
+      optimal_batch_size_((size_t)std::max(1, optimal_batch_size)),
       next_preferred_batch_size_(0),
+      pending_batch_delay_ns_(max_queue_delay_microseconds * 1000),
+      queued_batch_size_(0),
       enforce_equal_shape_tensors_(enforce_equal_shape_tensors),
-      has_optional_input_(false), preserve_ordering_(preserve_ordering)
-{
+      has_optional_input_(false),
+      preserve_ordering_(preserve_ordering) {
+  LOG_VERBOSE(1) << "Creating FrequencyBatchScheduler for model '"
+                 << model_->Name() << "' version '" << model_->Version() << "'"
+                 << " max_batch_size " << max_batch_size_
+                 << " optimal_batch_size " << optimal_batch_size_;
   rate_limiter_ = model_->Server()->GetRateLimiter();
   // Both the server and model config should specify
   // caching enabled for model to utilize response cache.
@@ -81,11 +159,6 @@ FrequencyBatchScheduler::FrequencyBatchScheduler(
         model_->Config().metric_tags(), &reporter_);
   }
 #endif  // TRITON_ENABLE_METRICS
-  max_preferred_batch_size_ = 0;
-  for (const auto size : preferred_batch_sizes_) {
-    max_preferred_batch_size_ =
-        std::max(max_preferred_batch_size_, (size_t)size);
-  }
 
   for (const auto& input : model_->Config().input()) {
     if (input.optional()) {
@@ -99,23 +172,20 @@ Status
 FrequencyBatchScheduler::Create(
     TritonModel* model, TritonModelInstance* model_instance, const int nice,
     const bool frequency_batching_enabled, const int32_t max_batch_size,
+    const int32_t optimal_batch_size,
     const std::unordered_map<std::string, bool>& enforce_equal_shape_tensors,
     const bool preserve_ordering, const bool response_cache_enable,
-    const std::set<int32_t>& preferred_batch_sizes,
     const uint64_t max_queue_delay_microseconds,
     std::unique_ptr<Scheduler>* scheduler)
 {
   inference::ModelFrequencyBatching batcher_config;
   batcher_config.set_preserve_ordering(preserve_ordering);
-  for (const auto& bs : preferred_batch_sizes) {
-    batcher_config.add_preferred_batch_size(bs);
-  }
   batcher_config.set_max_queue_delay_microseconds(max_queue_delay_microseconds);
 
   return Create(
       model, model_instance, nice, frequency_batching_enabled, max_batch_size,
-      enforce_equal_shape_tensors, batcher_config, response_cache_enable,
-      scheduler);
+      enforce_equal_shape_tensors, batcher_config,
+      response_cache_enable, scheduler);
 }
 
 Status
@@ -126,18 +196,11 @@ FrequencyBatchScheduler::Create(
     const inference::ModelFrequencyBatching& batcher_config,
     const bool response_cache_enable, std::unique_ptr<Scheduler>* scheduler)
 {
-  std::set<int32_t> preferred_batch_sizes;
-  for (const auto size : batcher_config.preferred_batch_size()) {
-    preferred_batch_sizes.insert(size);
-  }
-
   FrequencyBatchScheduler* dyna_sched = new FrequencyBatchScheduler(
       model, model_instance, frequency_batching_enabled, max_batch_size,
-      enforce_equal_shape_tensors, batcher_config.preserve_ordering(),
-      response_cache_enable, preferred_batch_sizes,
-      batcher_config.max_queue_delay_microseconds(),
-      batcher_config.default_queue_policy(), batcher_config.priority_levels(),
-      batcher_config.priority_queue_policy());
+      batcher_config.optimal_batch_size(), enforce_equal_shape_tensors,
+      batcher_config.preserve_ordering(), response_cache_enable,
+      batcher_config.max_queue_delay_microseconds());
   std::unique_ptr<FrequencyBatchScheduler> sched(dyna_sched);
 
   sched->scheduler_thread_exit_.store(false);
@@ -238,7 +301,10 @@ FrequencyBatchScheduler::Enqueue(std::unique_ptr<InferenceRequest>& request)
 
       // Assuming no error is returned, this call takes ownership of
       // 'request' and so we can't use it after this point.
-      RETURN_IF_ERROR(queue_.Enqueue(request->Priority(), request));
+      RETURN_IF_ERROR(queue_.Enqueue(request));
+
+      LOG_VERBOSE(1) << "FrequencyBatchScheduler queue size: "
+                     << queue_.Size() << ", queued_batch_size_: " << queued_batch_size_;
 
       // If there are any idle runners and the queued batch size is greater or
       // equal to next preferred batch size, then wake batcher up to service
@@ -259,6 +325,24 @@ FrequencyBatchScheduler::Enqueue(std::unique_ptr<InferenceRequest>& request)
     }
 
     if (wake_batcher) {
+      // log the reason for waking up the batcher
+      if (enforce_equal_shape_tensors_.empty()) {
+        std::lock_guard<std::mutex> exec_lock(*(curr_payload_->GetExecMutex()));
+        auto payload_state = curr_payload_->GetState();
+        if (payload_saturated_) {
+          LOG_VERBOSE(1) << "FrequencyBatchScheduler wake up batcher due to "
+                            "payload saturated";
+        } else if (IsStaleState(payload_state)) {
+          LOG_VERBOSE(1) << "FrequencyBatchScheduler wake up batcher due to "
+                            "stale state";
+        } else if (queued_batch_size_ >= optimal_batch_size_) {
+          LOG_VERBOSE(1) << "FrequencyBatchScheduler wake up batcher due to "
+                            "queued_batch_size_ >= optimal_batch_size_";
+        }
+      } else {
+        LOG_VERBOSE(1) << "FrequencyBatchScheduler wake up batcher due to "
+                          "enforce_equal_shape_tensors_";
+      }
       cv_.notify_one();
     }
   }
@@ -323,7 +407,6 @@ FrequencyBatchScheduler::BatcherThread(const int nice)
         auto payload_state = curr_payload_->GetState();
         if (payload_saturated_ || IsStaleState(payload_state)) {
           NewPayload();
-          next_preferred_batch_size_ = 0;
           required_equal_inputs_.clear();
         }
       }
@@ -354,15 +437,18 @@ FrequencyBatchScheduler::BatcherThread(const int nice)
             continue;
           }
 
-          // Use frequency batching to get request(s) to execute.
+          // // Use frequency batching to get request(s) to execute.
+          // wait_microseconds = GetFrequencyBatch();
+
           wait_microseconds = GetFrequencyBatch();
+          size_t pending_batch_queue_cnt = queue_.Cursor();
+          
+          LOG_VERBOSE(1) << "Frequency thread for " << model_->Name()
+                << " pending batch queue count " << pending_batch_queue_cnt
+                << " wait microseconds " << wait_microseconds;
 
-          // Get requests that are rejected from searching frequency batch.
-          queue_.ReleaseRejectedRequests(&rejected_requests);
-
-          // Extract batch only if there is pending batch
-          auto pending_batch_queue_cnt = queue_.PendingBatchCount();
-          if ((wait_microseconds == 0) && (pending_batch_queue_cnt != 0)) {
+          if (wait_microseconds == 0 && pending_batch_queue_cnt > 0) {
+            size_t sent_batch_size = 0;
             curr_payload_->ReserveRequests(pending_batch_queue_cnt);
             for (size_t idx = 0; idx < pending_batch_queue_cnt; ++idx) {
               std::unique_ptr<InferenceRequest> request;
@@ -371,6 +457,7 @@ FrequencyBatchScheduler::BatcherThread(const int nice)
                 if (preserve_ordering_ || response_cache_enabled_) {
                   DelegateResponse(request);
                 }
+                sent_batch_size += request->BatchSize();
                 curr_payload_->AddRequest(std::move(request));
               } else {
                 // The queue is empty which conflicts with pending batch
@@ -379,9 +466,7 @@ FrequencyBatchScheduler::BatcherThread(const int nice)
                 LOG_ERROR << request->LogRequest()
                           << "Failed to retrieve request from scheduler queue: "
                           << status.Message();
-                queue_.ResetCursor();
                 queued_batch_size_ = 0;
-                pending_batch_size_ = 0;
                 break;
               }
             }
@@ -389,9 +474,11 @@ FrequencyBatchScheduler::BatcherThread(const int nice)
             if (curr_payload_->GetState() == Payload::State::UNINITIALIZED) {
               curr_payload_->SetState(Payload::State::READY);
             }
-
-            queued_batch_size_ -= pending_batch_size_;
-            pending_batch_size_ = 0;
+            queued_batch_size_ -= sent_batch_size;
+            LOG_VERBOSE(1) << "Frequency batcher thread " << model_->Name()
+                           << " sent " << pending_batch_queue_cnt
+                           << " requests, queue size = " << queue_.Size()
+                           << " queued batch size = " << queued_batch_size_;
           }
         }
       }
@@ -438,160 +525,35 @@ FrequencyBatchScheduler::GetFrequencyBatch()
   // immediately. Stop examining requests if the maximum preferred
   // batch size would be exceeded or if the shape of the next request
   // does not match the shape of the pending batch.
-  bool send_now = false;
-  if (!queue_.IsCursorValid()) {
-    queue_.ResetCursor();
-    pending_batch_size_ = 0;
-  }
-  size_t best_preferred_batch_size = 0;
-  queued_batch_size_ -= queue_.ApplyPolicyAtCursor();
+  // bool send_now = false;
 
-  // When there is optional input or input shape must be enforced,
-  // the inputs in the requests must be examined for forming a batch
-  const bool check_input =
-      !enforce_equal_shape_tensors_.empty() || has_optional_input_;
   auto payload_batch_size = curr_payload_->BatchSize();
-  while (!queue_.CursorEnd()) {
-    const auto batch_size = std::max(1U, queue_.RequestAtCursor()->BatchSize());
 
-    // If there is no pending batch, then this request is starting a
-    // new batch.
-    if ((payload_batch_size + queue_.PendingBatchCount()) == 0) {
-      // Get the shape of the new batch that is being started...
-      if (check_input) {
-        if (!InitRequiredEqualInputs(
-                 queue_.RequestAtCursor(), enforce_equal_shape_tensors_,
-                 has_optional_input_, &required_equal_inputs_)
-                 .IsOk()) {
-          send_now = true;
-          break;
-        }
-      }
-    } else {
-      // There is a pending batch and adding this request would make
-      // the batch size larger than all of the preferred batch sizes,
-      // so mark the cursor at this point. Not sending the pending batch so
-      // that we can examine the queue delay of requests that fits in a batch.
-      if (((payload_batch_size + pending_batch_size_ + batch_size) >
-           max_preferred_batch_size_) &&
-          (best_preferred_batch_size == 0)) {
-        best_preferred_batch_size = pending_batch_size_;
-        queue_.MarkCursor();
-        payload_saturated_ = true;
-      }
-      if ((payload_batch_size + pending_batch_size_ + batch_size) >
-          max_batch_size_) {
-        send_now = true;
-        break;
-      }
-
-      // There is a pending batch and it has a different shape then
-      // this request, so send the pending batch as it is.
-      if (check_input && !CompareWithRequiredEqualInputs(
-                             queue_.RequestAtCursor(), has_optional_input_,
-                             required_equal_inputs_)) {
-        curr_payload_->MarkSaturated();
-        send_now = true;
-        break;
-      }
-    }
-
-    pending_batch_size_ += batch_size;
-    queue_.AdvanceCursor();
-    queued_batch_size_ -= queue_.ApplyPolicyAtCursor();
-
-    if (preferred_batch_sizes_.find(pending_batch_size_ + payload_batch_size) !=
-        preferred_batch_sizes_.end()) {
-      best_preferred_batch_size = pending_batch_size_;
-      queue_.MarkCursor();
-    }
-  }
-
-  // Obatin the age of the oldest pending request to compare with the maximum
-  // batch queuing delay
+  // get time now ns
   uint64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                         std::chrono::steady_clock::now().time_since_epoch())
                         .count();
-  uint64_t delay_ns = now_ns - queue_.OldestEnqueueTime();
-  bool delay_is_exceeded =
-      (pending_batch_delay_ns_ != 0) && (delay_ns >= pending_batch_delay_ns_);
+  size_t timeout_batch_size = queue_.FindTimeout(now_ns - pending_batch_delay_ns_);
+  if (payload_batch_size + timeout_batch_size >= optimal_batch_size_) {
+    return 0;  // send these requests now
+  }
 
-  // If we found a preferred batch size and the queue delay hasn't been
-  // exceeded, then execute that.
-  if ((best_preferred_batch_size != 0) && !delay_is_exceeded) {
-    if (pending_batch_delay_ns_ == 0) {
-      payload_saturated_ = true;
-    }
-    pending_batch_size_ = best_preferred_batch_size;
-    queue_.SetCursorToMark();
+  size_t remaining_batch_size = optimal_batch_size_ - payload_batch_size;
+  size_t actual_batch_size = queue_.TryToBatch(remaining_batch_size);
+  LOG_VERBOSE(1) << "Frequency batcher thread " << model_->Name()
+                 << " timeout_batch_size = " << timeout_batch_size
+                 << " payload_batch_size = " << payload_batch_size
+                  << " actual_batch_size = " << actual_batch_size;
+  if (timeout_batch_size > 0) {
+    next_preferred_batch_size_ = 0;
+  } else if (actual_batch_size > 0) {
+    next_preferred_batch_size_ = actual_batch_size;
+  }
+  if (timeout_batch_size + actual_batch_size > 0) {
     return 0;
   }
-
-  // No request in pending batch happens when all queued requests have expired
-  // timeout and the policies are REJECT
-  if (queue_.PendingBatchCount() == 0) {
-    return 0;
-  }
-
-  // If the delay has been exceeded, or if the current batch can't grow
-  // any larger then just immediately execute whatever is pending.
-  if (send_now || ((payload_batch_size + pending_batch_size_) >=
-                   max_preferred_batch_size_)) {
-    payload_saturated_ = true;
-    return 0;
-  }
-
-  if (delay_is_exceeded || (pending_batch_delay_ns_ == 0)) {
-    return 0;
-  }
-
-  // Set the next preferred batch size given the pending batch size
-  auto next_preferred_batch_size_it = preferred_batch_sizes_.upper_bound(
-      pending_batch_size_ + payload_batch_size);
-  if (next_preferred_batch_size_it != preferred_batch_sizes_.end()) {
-    next_preferred_batch_size_ = *next_preferred_batch_size_it;
-  } else {
-    next_preferred_batch_size_ =
-        preferred_batch_sizes_.empty() ? 0 : *preferred_batch_sizes_.begin();
-  }
-  if (next_preferred_batch_size_ != 0) {
-    next_preferred_batch_size_ -= payload_batch_size;
-  }
-
-  // By this point, we have not seen the pending batch that should be executed
-  // immediately. However, if we have scheduled a payload that can be grown and
-  // not yet in preferred batch size, we should move the pending batch over to
-  // ensure the model instance will pick up largest available batch even if it
-  // is not the preferred batch.
-  if (!payload_saturated_ && (payload_batch_size != 0) &&
-      (preferred_batch_sizes_.find(payload_batch_size) ==
-       preferred_batch_sizes_.end())) {
-    return 0;
-  }
-
-  uint64_t wait_ns = pending_batch_delay_ns_ - delay_ns;
-  // Note that taking request timeout into consideration allows us to reset
-  // pending batch as soon as it is invalidated. But the cost is that in edge
-  // case where the timeout will be expired one by one, the thread will be
-  // waken frequently.
-  if (queue_.ClosestTimeout() != 0) {
-    if (now_ns <= queue_.ClosestTimeout()) {
-      wait_ns = std::min(queue_.ClosestTimeout() - now_ns, wait_ns);
-    } else {
-      // A request in pending batch is timed-out, wait for 1 us to force the
-      // thread to reset the pending batch right the way.
-      wait_ns = 1000;
-    }
-  }
-
-  // Return non-zero wait microseconds to cause this thread to wait
-  // until the queue delay or the closest timeout has expired.
-  // Another thread may be awaken due to incoming request to handle the
-  // pending batch before this thread wakes and that is ok. But if no other
-  // request comes in then this thread will wake and revisit the pending batch
-  // (and at that time will then see the delay has been exceeded and will send
-  // the batch).
-  return wait_ns / 1000;
+  
+  return 5 * 1000; // wait 5 ms
 }
 
 void

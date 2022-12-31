@@ -1699,6 +1699,10 @@ ValidateModelConfigInt64()
       "microseconds",
       "ModelConfig::dynamic_batching::priority_queue_policy::value::default_"
       "timeout_microseconds",
+      "ModelConfig::frequency_batching::optimal_batch_size",
+      "ModelConfig::frequency_batching::default_queue_policy::default_timeout_microseconds",
+      "ModelConfig::frequency_batching::priority_queue_policy::value::default_timeout_microseconds",
+      "ModelConfig::frequency_batching::max_queue_delay_microseconds",
       "ModelConfig::sequence_batching::direct::max_queue_delay_microseconds",
       "ModelConfig::sequence_batching::state::dims",
       "ModelConfig::sequence_batching::state::initial_state::dims",
